@@ -8,8 +8,9 @@ import shutil
 from datetime import datetime
 from ..database import get_db
 from ..models import User, ActivationRequest, ActivationStatus
-from .auth import get_current_user, get_current_admin_user  # This will now work
+from .auth import get_current_user, get_current_admin_user
 from pydantic import BaseModel
+from sqlalchemy import func
 
 router = APIRouter()
 
@@ -23,15 +24,10 @@ class ActivationRequestCreate(BaseModel):
     property_address: str
     property_type: str
     business_name: Optional[str] = None
-    business_license: Optional[str] = None
     tax_id: Optional[str] = None
     experience_years: int = 0
     previous_listings_count: int = 0
     reason_for_activation: Optional[str] = None
-
-class ActivationRequestUpdate(BaseModel):
-    status: str
-    rejection_reason: Optional[str] = None
 
 # ============ UPLOAD DOCUMENTS ============
 @router.post("/upload-document")
@@ -83,20 +79,17 @@ async def submit_activation_request(
     db: Session = Depends(get_db)
 ):
     try:
-        # Check if user already has a pending request
         existing_request = db.query(ActivationRequest).filter(
             ActivationRequest.user_id == current_user.id,
-            ActivationRequest.status == ActivationStatus.PENDING
+            func.lower(ActivationRequest.status) == "pending"
         ).first()
         
         if existing_request:
             raise HTTPException(status_code=400, detail="You already have a pending activation request")
         
-        # If user is already activated
         if current_user.is_activated:
             raise HTTPException(status_code=400, detail="Your account is already activated")
         
-        # Create activation request
         activation_request = ActivationRequest(
             user_id=current_user.id,
             full_name=request_data.full_name,
@@ -109,14 +102,13 @@ async def submit_activation_request(
             experience_years=request_data.experience_years,
             previous_listings_count=request_data.previous_listings_count,
             reason_for_activation=request_data.reason_for_activation,
-            status=ActivationStatus.PENDING
+            status="pending"
         )
         
         db.add(activation_request)
         db.commit()
         db.refresh(activation_request)
         
-        # Update user with activation request ID
         current_user.activation_request_id = activation_request.id
         db.commit()
         
@@ -147,10 +139,9 @@ async def get_activation_status(
                 "message": "Your account is activated"
             }
         
-        # Check for pending request
         pending_request = db.query(ActivationRequest).filter(
             ActivationRequest.user_id == current_user.id,
-            ActivationRequest.status == ActivationStatus.PENDING
+            func.lower(ActivationRequest.status) == "pending"
         ).first()
         
         if pending_request:
@@ -162,10 +153,9 @@ async def get_activation_status(
                 "submitted_at": pending_request.created_at.isoformat()
             }
         
-        # Check for rejected request
         rejected_request = db.query(ActivationRequest).filter(
             ActivationRequest.user_id == current_user.id,
-            ActivationRequest.status == ActivationStatus.REJECTED
+            func.lower(ActivationRequest.status) == "rejected"
         ).order_by(ActivationRequest.created_at.desc()).first()
         
         if rejected_request:
@@ -187,57 +177,31 @@ async def get_activation_status(
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============ GET USER'S ACTIVATION REQUEST ============
-@router.get("/my-request")
-async def get_my_activation_request(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        request = db.query(ActivationRequest).filter(
-            ActivationRequest.user_id == current_user.id
-        ).order_by(ActivationRequest.created_at.desc()).first()
-        
-        if not request:
-            raise HTTPException(status_code=404, detail="No activation request found")
-        
-        return {
-            "id": request.id,
-            "full_name": request.full_name,
-            "email": request.email,
-            "phone_number": request.phone_number,
-            "property_address": request.property_address,
-            "property_type": request.property_type,
-            "business_name": request.business_name,
-            "tax_id": request.tax_id,
-            "experience_years": request.experience_years,
-            "previous_listings_count": request.previous_listings_count,
-            "reason_for_activation": request.reason_for_activation,
-            "status": request.status.value,
-            "rejection_reason": request.rejection_reason,
-            "created_at": request.created_at.isoformat()
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============ ADMIN: GET ALL PENDING REQUESTS ============
+# ============ ADMIN: GET PENDING REQUESTS ============
 @router.get("/admin/pending-requests")
 async def get_pending_activation_requests(
     current_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_db)
 ):
     try:
+        # Use case-insensitive search for status
         requests = db.query(ActivationRequest).filter(
-            ActivationRequest.status == ActivationStatus.PENDING
+            func.lower(ActivationRequest.status) == "pending"
         ).order_by(ActivationRequest.created_at.desc()).all()
+        
+        print(f"Found {len(requests)} pending requests")
         
         result = []
         for req in requests:
             user = db.query(User).filter(User.id == req.user_id).first()
+            
+            property_photos = []
+            if req.property_photos:
+                try:
+                    property_photos = json.loads(req.property_photos) if isinstance(req.property_photos, str) else req.property_photos
+                except:
+                    property_photos = []
+            
             result.append({
                 "id": req.id,
                 "user_id": req.user_id,
@@ -253,15 +217,21 @@ async def get_pending_activation_requests(
                 "experience_years": req.experience_years,
                 "previous_listings_count": req.previous_listings_count,
                 "reason_for_activation": req.reason_for_activation,
-                "status": req.status.value,
-                "created_at": req.created_at.isoformat()
+                "status": str(req.status).lower() if req.status else "pending",
+                "ownership_document": req.ownership_document,
+                "business_license": req.business_license,
+                "property_photos": property_photos,
+                "rejection_reason": req.rejection_reason,
+                "created_at": req.created_at.isoformat() if req.created_at else None
             })
         
         return result
         
     except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in pending-requests: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 # ============ ADMIN: GET ALL REQUESTS ============
 @router.get("/admin/all-requests")
@@ -274,9 +244,19 @@ async def get_all_activation_requests(
             ActivationRequest.created_at.desc()
         ).all()
         
+        print(f"Found {len(requests)} total requests")
+        
         result = []
         for req in requests:
             user = db.query(User).filter(User.id == req.user_id).first()
+            
+            property_photos = []
+            if req.property_photos:
+                try:
+                    property_photos = json.loads(req.property_photos) if isinstance(req.property_photos, str) else req.property_photos
+                except:
+                    property_photos = []
+            
             result.append({
                 "id": req.id,
                 "user_id": req.user_id,
@@ -292,19 +272,24 @@ async def get_all_activation_requests(
                 "experience_years": req.experience_years,
                 "previous_listings_count": req.previous_listings_count,
                 "reason_for_activation": req.reason_for_activation,
-                "status": req.status.value,
+                "status": str(req.status).lower() if req.status else "pending",
                 "rejection_reason": req.rejection_reason,
-                "created_at": req.created_at.isoformat(),
+                "ownership_document": req.ownership_document,
+                "business_license": req.business_license,
+                "property_photos": property_photos,
+                "created_at": req.created_at.isoformat() if req.created_at else None,
                 "reviewed_at": req.reviewed_at.isoformat() if req.reviewed_at else None
             })
         
         return result
         
     except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in all-requests: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
-# ============ ADMIN: APPROVE ACTIVATION REQUEST ============
+# ============ ADMIN: APPROVE REQUEST ============
 @router.post("/admin/approve/{request_id}")
 async def approve_activation_request(
     request_id: int,
@@ -319,11 +304,14 @@ async def approve_activation_request(
         if not activation_request:
             raise HTTPException(status_code=404, detail="Activation request not found")
         
-        if activation_request.status != ActivationStatus.PENDING:
+        # Check status case-insensitive
+        req_status = str(activation_request.status).lower() if activation_request.status else "pending"
+        
+        if req_status != "pending":
             raise HTTPException(status_code=400, detail="This request has already been processed")
         
         # Update activation request
-        activation_request.status = ActivationStatus.APPROVED
+        activation_request.status = "approved"
         activation_request.reviewed_by = current_user.id
         activation_request.reviewed_at = datetime.utcnow()
         
@@ -331,6 +319,7 @@ async def approve_activation_request(
         user = db.query(User).filter(User.id == activation_request.user_id).first()
         user.is_activated = True
         user.activated_at = datetime.utcnow()
+        user.status = "active"
         
         db.commit()
         
@@ -342,11 +331,11 @@ async def approve_activation_request(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error approving request: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============ ADMIN: REJECT ACTIVATION REQUEST ============
+# ============ ADMIN: REJECT REQUEST ============
 @router.post("/admin/reject/{request_id}")
 async def reject_activation_request(
     request_id: int,
@@ -362,13 +351,16 @@ async def reject_activation_request(
         if not activation_request:
             raise HTTPException(status_code=404, detail="Activation request not found")
         
-        if activation_request.status != ActivationStatus.PENDING:
+        # Check status case-insensitive
+        req_status = str(activation_request.status).lower() if activation_request.status else "pending"
+        
+        if req_status != "pending":
             raise HTTPException(status_code=400, detail="This request has already been processed")
         
         rejection_reason = rejection_data.get("rejection_reason", "No reason provided")
         
         # Update activation request
-        activation_request.status = ActivationStatus.REJECTED
+        activation_request.status = "rejected"
         activation_request.rejection_reason = rejection_reason
         activation_request.reviewed_by = current_user.id
         activation_request.reviewed_at = datetime.utcnow()
@@ -383,28 +375,27 @@ async def reject_activation_request(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error rejecting request: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-# ============ GET PENDING COUNT FOR NOTIFICATION ============
-# ============ GET PENDING COUNT FOR NOTIFICATION ============
+
+# ============ ADMIN: GET PENDING COUNT FOR BADGE ============
 @router.get("/pending-count")
 async def get_pending_count(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
-        # For admin: get count of pending activation requests
         if current_user.role_type == "admin":
             count = db.query(ActivationRequest).filter(
-                ActivationRequest.status == "pending"
+                func.lower(ActivationRequest.status) == "pending"
             ).count()
+            print(f"Pending count: {count}")
             return {"count": count}
         
-        # For regular users: check their own pending request
         pending = db.query(ActivationRequest).filter(
             ActivationRequest.user_id == current_user.id,
-            ActivationRequest.status == "pending"
+            func.lower(ActivationRequest.status) == "pending"
         ).first()
         
         return {"has_pending": pending is not None}
@@ -412,3 +403,27 @@ async def get_pending_count(
     except Exception as e:
         print(f"Error getting pending count: {e}")
         return {"count": 0}
+
+# ============ Force update existing records to lowercase ============
+@router.get("/admin/fix-status")
+async def fix_status_case(
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db)
+):
+    """Convert all status values to lowercase"""
+    try:
+        requests = db.query(ActivationRequest).all()
+        updated = 0
+        for req in requests:
+            if req.status and req.status != req.status.lower():
+                req.status = req.status.lower()
+                updated += 1
+        
+        db.commit()
+        return {
+            "success": True,
+            "message": f"Updated {updated} records to lowercase status"
+        }
+    except Exception as e:
+        print(f"Error fixing status: {e}")
+        return {"success": False, "error": str(e)}

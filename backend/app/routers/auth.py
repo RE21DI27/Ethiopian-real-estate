@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 import bcrypt
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
 from ..database import get_db
 from ..models import User
@@ -16,8 +16,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 # ============ PYDANTIC MODELS ============
 class UserCreate(BaseModel):
     email: EmailStr
-    username: str
-    password: str
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6)
     full_name: str
     phone: Optional[str] = None
 
@@ -31,16 +31,18 @@ class UserResponse(BaseModel):
     status: str
     is_active: bool
     is_verified: bool
+    is_activated: bool
     created_at: Optional[str]
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
-# ============ HELPER FUNCTIONS ============
-def is_test_user(email: str) -> bool:
-    return email == "dani@gmail.com"
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
+# ============ HELPER FUNCTIONS ============
 def get_password_hash(password: str) -> str:
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
@@ -84,51 +86,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 
 async def get_current_admin_user(current_user: User = Depends(get_current_user)):
     """Get current user and verify they are an admin"""
-    if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
     if current_user.role_type != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
         )
-    
-    return current_user
-
-async def get_current_seller_user(current_user: User = Depends(get_current_user)):
-    """Get current user and verify they are a seller or dual role"""
-    if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-        )
-    
-    if current_user.role_type not in ["seller", "dual", "admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Seller access required"
-        )
-    
-    return current_user
-
-async def get_current_landlord_user(current_user: User = Depends(get_current_user)):
-    """Get current user and verify they are a landlord or dual role"""
-    if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-        )
-    
-    if current_user.role_type not in ["landlord", "dual", "admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Landlord access required"
-        )
-    
     return current_user
 
 # ============ REGISTER ENDPOINT ============
@@ -153,25 +115,21 @@ async def register(user_data: UserCreate, db: Session = Depends(get_db)):
             username=user_data.username,
             full_name=user_data.full_name,
             hashed_password=hashed_password,
+            password=hashed_password,
             phone=user_data.phone or "",
-            role_type="buyer",
+            role_type="user",
             status="pending",
             is_active=True,
             is_verified=False,
-            is_activated=False,  # Not activated by default
-            seller_enabled=False,
-            seller_approved=False,
-            seller_paid=False,
-            landlord_enabled=False,
-            landlord_approved=False,
-            landlord_paid=False
+            is_activated=False,
+            created_at=datetime.utcnow()
         )
         
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
         
-        print(f"User registered successfully: {db_user.email}")
+        print(f"User registered successfully: {db_user.email} (role: {db_user.role_type})")
         
         return UserResponse(
             id=db_user.id,
@@ -183,6 +141,7 @@ async def register(user_data: UserCreate, db: Session = Depends(get_db)):
             status=db_user.status,
             is_active=db_user.is_active,
             is_verified=db_user.is_verified,
+            is_activated=db_user.is_activated,
             created_at=db_user.created_at.isoformat() if db_user.created_at else None
         )
         
@@ -195,46 +154,23 @@ async def register(user_data: UserCreate, db: Session = Depends(get_db)):
 
 # ============ LOGIN ENDPOINT ============
 @router.post("/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+async def login(login_data: LoginRequest, db: Session = Depends(get_db)):
     try:
         # Find user by email or username
         user = db.query(User).filter(
-            (User.email == form_data.username) | (User.username == form_data.username)
+            (User.email == login_data.username) | (User.username == login_data.username)
         ).first()
         
         if not user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
         # Verify password
-        if not verify_password(form_data.password, user.hashed_password):
+        if not verify_password(login_data.password, user.hashed_password):
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
-        # Handle test user
-        if is_test_user(user.email):
-            user.status = "active"
-            user.is_active = True
-            user.is_verified = True
-            user.is_activated = True
-            user.seller_approved = True
-            user.seller_paid = True
-            user.seller_enabled = True
-            user.landlord_approved = True
-            user.landlord_paid = True
-            user.landlord_enabled = True
-            user.role_type = "dual"
-            db.commit()
-        
         # Check if account is suspended
-        if user.status == "suspended" and not is_test_user(user.email):
+        if user.status == "suspended":
             raise HTTPException(status_code=403, detail="Account suspended")
-        
-        # Auto-activate admin users
-        if user.role_type == "admin" and user.status != "active":
-            user.status = "active"
-            user.is_active = True
-            user.is_verified = True
-            user.is_activated = True
-            db.commit()
         
         # Create access token
         access_token = create_access_token(data={"sub": user.email})
@@ -260,5 +196,6 @@ async def get_current_user_endpoint(current_user: User = Depends(get_current_use
         status=current_user.status,
         is_active=current_user.is_active,
         is_verified=current_user.is_verified,
+        is_activated=current_user.is_activated,
         created_at=current_user.created_at.isoformat() if current_user.created_at else None
     )

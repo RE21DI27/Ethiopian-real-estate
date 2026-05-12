@@ -23,12 +23,15 @@ class ActivationRequest(Base):
     property_address = Column(String(500), nullable=False)
     property_type = Column(String(100), nullable=False)
     ownership_document = Column(String(500), nullable=True)
-    property_photos = Column(Text, nullable=True)  # JSON array of photo URLs
+    property_photos = Column(Text, nullable=True)
     
-    # Business Information (for agents/landlords)
+    # Business Information
     business_name = Column(String(255), nullable=True)
     business_license = Column(String(500), nullable=True)
     tax_id = Column(String(100), nullable=True)
+    
+    # Government ID
+    government_id = Column(String(500), nullable=True)
     
     # Additional Info
     experience_years = Column(Integer, default=0)

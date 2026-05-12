@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
-from .routers import auth, admin, listings, users, messages, notifications, payments, settings, password_reset, activation
+from .routers import auth, admin, listings, users, messages, notifications, payments, settings, password_reset, activation, buyer, buyer_auth
 from .database import engine, Base
 
 # Create uploads directory
@@ -18,16 +18,23 @@ app = FastAPI(title="RealEstate Pro API", docs_url="/docs")
 # Mount static files for uploads
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# CORS - Allow all necessary origins
+# CORS - Allow frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins="*",
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "*"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Register routers
+# Register routers - ALL ROUTERS INCLUDING BUYER
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(listings.router, prefix="/api/listings", tags=["listings"])
@@ -38,6 +45,8 @@ app.include_router(payments.router, prefix="/api/payments", tags=["payments"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(password_reset.router, prefix="/api/password-reset", tags=["password-reset"])
 app.include_router(activation.router, prefix="/api/activation", tags=["activation"])
+app.include_router(buyer.router, prefix="/api/buyer", tags=["buyer"])
+app.include_router(buyer_auth.router, prefix="/api/buyer/auth", tags=["buyer-auth"])
 
 @app.get("/")
 def root():

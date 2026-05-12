@@ -1,274 +1,178 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, or_, and_
-from typing import Optional
+from sqlalchemy import desc, or_
+from typing import List, Optional
 from datetime import datetime
-from ..database import get_db
-from ..models import User
-from ..models.message import Message, Conversation
-from .auth import get_current_user
 from pydantic import BaseModel
+from ..database import get_db
+from ..models import User, Message, Conversation
+from .auth import get_current_user
 
 router = APIRouter()
 
-class MessageSend(BaseModel):
+class SendMessageRequest(BaseModel):
     receiver_id: int
-    content: str
+    message: str
+    subject: Optional[str] = None
+
+class StartConversationRequest(BaseModel):
+    property_id: int
+    message: str
 
 @router.post("/send")
 async def send_message(
-    message_data: MessageSend,
+    request: SendMessageRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Send a message to another user"""
     try:
-        print(f"=== SENDING MESSAGE ===")
-        print(f"From user: {current_user.id} ({current_user.email})")
-        print(f"To user: {message_data.receiver_id}")
-        print(f"Content: {message_data.content[:50]}...")
-        
         # Check if receiver exists
-        receiver = db.query(User).filter(User.id == message_data.receiver_id).first()
+        receiver = db.query(User).filter(User.id == request.receiver_id).first()
         if not receiver:
-            print(f"Receiver not found: {message_data.receiver_id}")
             raise HTTPException(status_code=404, detail="Receiver not found")
         
-        # Create new message - WITHOUT updated_at field
-        new_message = Message(
-            sender_id=current_user.id,
-            receiver_id=message_data.receiver_id,
-            content=message_data.content,
-            is_read=False,
-            has_attachment=False,
-            attachment_url=None
-            # No updated_at field here
-        )
-        
-        db.add(new_message)
-        db.flush()
-        
-        # Update or create conversation
-        user1_id = min(current_user.id, message_data.receiver_id)
-        user2_id = max(current_user.id, message_data.receiver_id)
-        
-        conv = db.query(Conversation).filter(
-            Conversation.user1_id == user1_id,
-            Conversation.user2_id == user2_id
+        # Check if conversation exists
+        conversation = db.query(Conversation).filter(
+            or_(
+                Conversation.buyer_id == current_user.id,
+                Conversation.seller_id == current_user.id
+            )
         ).first()
         
-        if not conv:
-            conv = Conversation(
-                user1_id=user1_id,
-                user2_id=user2_id,
-                last_message=message_data.content[:200],
+        if not conversation:
+            # Create new conversation
+            conversation = Conversation(
+                buyer_id=current_user.id,
+                seller_id=request.receiver_id,
+                last_message=request.message,
                 last_message_time=datetime.utcnow(),
-                unread_count_user1=0,
-                unread_count_user2=0
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
             )
-            db.add(conv)
-        else:
-            conv.last_message = message_data.content[:200]
-            conv.last_message_time = datetime.utcnow()
+            db.add(conversation)
+            db.commit()
+            db.refresh(conversation)
+        
+        # Create message
+        new_message = Message(
+            conversation_id=conversation.id,
+            sender_id=current_user.id,
+            receiver_id=request.receiver_id,
+            content=request.message,
+            subject=request.subject or "New Message",
+            is_read=False,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_message)
+        
+        # Update conversation last message
+        conversation.last_message = request.message[:100]
+        conversation.last_message_time = datetime.utcnow()
+        conversation.updated_at = datetime.utcnow()
         
         # Update unread count for receiver
-        if conv.user1_id == message_data.receiver_id:
-            conv.unread_count_user1 += 1
+        if conversation.buyer_id == request.receiver_id:
+            conversation.buyer_unread = (conversation.buyer_unread or 0) + 1
         else:
-            conv.unread_count_user2 += 1
+            conversation.seller_unread = (conversation.seller_unread or 0) + 1
         
         db.commit()
-        
-        print(f"✅ Message sent successfully! ID: {new_message.id}")
         
         return {
             "success": True,
             "message": "Message sent successfully",
             "message_id": new_message.id,
-            "created_at": new_message.created_at.isoformat() if new_message.created_at else None
+            "conversation_id": conversation.id
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error sending message: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error sending message: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/conversations")
 async def get_conversations(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get all conversations for the current user"""
+    """Get all conversations for current user"""
     try:
-        print(f"Getting conversations for user: {current_user.id}")
-        
         conversations = db.query(Conversation).filter(
             or_(
-                Conversation.user1_id == current_user.id,
-                Conversation.user2_id == current_user.id
+                Conversation.buyer_id == current_user.id,
+                Conversation.seller_id == current_user.id
             )
-        ).order_by(desc(Conversation.last_message_time)).all()
+        ).order_by(desc(Conversation.updated_at)).all()
         
         result = []
         for conv in conversations:
-            other_user_id = conv.user2_id if conv.user1_id == current_user.id else conv.user1_id
+            other_user_id = conv.seller_id if conv.buyer_id == current_user.id else conv.buyer_id
             other_user = db.query(User).filter(User.id == other_user_id).first()
+            unread_count = conv.buyer_unread if conv.buyer_id == current_user.id else conv.seller_unread
             
-            if other_user:
-                unread_count = conv.unread_count_user1 if conv.user1_id == current_user.id else conv.unread_count_user2
-                
-                result.append({
-                    "id": conv.id,
-                    "user_id": other_user.id,
-                    "name": other_user.full_name or other_user.username,
-                    "email": other_user.email,
-                    "role_type": other_user.role_type,
-                    "last_message": conv.last_message,
-                    "last_message_time": conv.last_message_time.isoformat() if conv.last_message_time else None,
-                    "unread_count": unread_count
-                })
+            result.append({
+                "id": conv.id,
+                "other_user_id": other_user_id,
+                "other_user_name": other_user.full_name if other_user else "User",
+                "other_user_avatar": other_user.full_name[0] if other_user else "U",
+                "last_message": conv.last_message or "No messages",
+                "last_message_time": conv.last_message_time.isoformat() if conv.last_message_time else None,
+                "unread_count": unread_count or 0,
+                "is_buyer": conv.buyer_id == current_user.id
+            })
         
-        print(f"Found {len(result)} conversations")
         return result
-        
     except Exception as e:
         print(f"Error getting conversations: {e}")
         return []
 
-@router.get("/conversation/{user_id}")
-async def get_conversation_messages(
-    user_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    limit: int = Query(50, ge=1, le=100)
-):
-    """Get messages between current user and another user"""
-    try:
-        print(f"Getting conversation between user {current_user.id} and {user_id}")
-        
-        other_user = db.query(User).filter(User.id == user_id).first()
-        if not other_user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Get messages between the two users
-        messages = db.query(Message).filter(
-            or_(
-                and_(Message.sender_id == current_user.id, Message.receiver_id == user_id),
-                and_(Message.sender_id == user_id, Message.receiver_id == current_user.id)
-            )
-        ).order_by(Message.created_at.asc()).limit(limit).all()
-        
-        # Mark unread messages as read
-        db.query(Message).filter(
-            Message.sender_id == user_id,
-            Message.receiver_id == current_user.id,
-            Message.is_read == False
-        ).update({"is_read": True})
-        
-        # Update conversation unread count
-        user1_id = min(current_user.id, user_id)
-        user2_id = max(current_user.id, user_id)
-        
-        conv = db.query(Conversation).filter(
-            Conversation.user1_id == user1_id,
-            Conversation.user2_id == user2_id
-        ).first()
-        
-        if conv:
-            if conv.user1_id == current_user.id:
-                conv.unread_count_user1 = 0
-            else:
-                conv.unread_count_user2 = 0
-            db.commit()
-        
-        # Format messages
-        message_list = []
-        for msg in messages:
-            message_list.append({
-                "id": msg.id,
-                "sender_id": msg.sender_id,
-                "receiver_id": msg.receiver_id,
-                "content": msg.content,
-                "is_read": msg.is_read,
-                "is_sent_by_me": msg.sender_id == current_user.id,
-                "created_at": msg.created_at.isoformat() if msg.created_at else None
-            })
-        
-        print(f"Found {len(message_list)} messages")
-        
-        return {
-            "other_user": {
-                "id": other_user.id,
-                "name": other_user.full_name or other_user.username,
-                "email": other_user.email,
-                "role": other_user.role_type
-            },
-            "messages": message_list
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error getting conversation: {e}")
-        return {"other_user": None, "messages": []}
-
-@router.get("/users")
-async def get_all_users(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    search: Optional[str] = None
-):
-    """Get all users for starting a new chat (including admins)"""
-    try:
-        print(f"Getting all users for messaging (excluding current user {current_user.id})")
-        
-        query = db.query(User).filter(User.id != current_user.id)
-        
-        if search:
-            query = query.filter(
-                or_(
-                    User.full_name.ilike(f"%{search}%"),
-                    User.username.ilike(f"%{search}%"),
-                    User.email.ilike(f"%{search}%")
-                )
-            )
-        
-        users = query.order_by(User.full_name).limit(50).all()
-        
-        result = []
-        for user in users:
-            result.append({
-                "id": user.id,
-                "name": user.full_name or user.username,
-                "email": user.email,
-                "role_type": user.role_type,
-                "status": user.status
-            })
-        
-        print(f"Found {len(result)} users")
-        return result
-        
-    except Exception as e:
-        print(f"Error getting users: {e}")
-        return []
-
-@router.get("/unread-count")
-async def get_unread_count(
+@router.get("/conversations/{conversation_id}/messages")
+async def get_messages(
+    conversation_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get total unread message count"""
+    """Get all messages in a conversation"""
     try:
-        count = db.query(Message).filter(
-            Message.receiver_id == current_user.id,
-            Message.is_read == False
-        ).count()
+        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
         
-        return {"unread_count": count}
+        # Check authorization
+        if conv.buyer_id != current_user.id and conv.seller_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized")
         
+        # Mark as read
+        if conv.buyer_id == current_user.id:
+            conv.buyer_unread = 0
+        else:
+            conv.seller_unread = 0
+        db.commit()
+        
+        messages = db.query(Message).filter(
+            Message.conversation_id == conversation_id
+        ).order_by(Message.created_at.asc()).all()
+        
+        result = []
+        for msg in messages:
+            result.append({
+                "id": msg.id,
+                "sender_id": msg.sender_id,
+                "receiver_id": msg.receiver_id,
+                "message": msg.content,
+                "subject": msg.subject,
+                "is_read": msg.is_read,
+                "is_mine": msg.sender_id == current_user.id,
+                "created_at": msg.created_at.isoformat(),
+                "time": msg.created_at.strftime("%I:%M %p") if msg.created_at else ""
+            })
+        
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error getting unread count: {e}")
-        return {"unread_count": 0}
+        print(f"Error getting messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

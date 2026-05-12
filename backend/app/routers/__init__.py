@@ -8,6 +8,8 @@ from . import payments
 from . import settings
 from . import password_reset
 from . import activation
+from . import buyer_auth  # Import buyer_auth instead of buyer
+from . import buyer        # Import buyer (your existing buyer router)
 
 __all__ = [
     "auth",
@@ -19,5 +21,7 @@ __all__ = [
     "payments",
     "settings",
     "password_reset",
-    "activation"
+    "activation",
+    "buyer_auth",
+    "buyer"
 ]

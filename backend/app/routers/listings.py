@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
 from sqlalchemy.orm import Session
+from sqlalchemy import desc, and_
 from typing import Optional, List
 import json
 import os
@@ -166,26 +167,24 @@ async def create_listing(
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============ GET MY LISTINGS (FIXED - SHOWS DRAFTS BY DEFAULT) ============
+# ============ GET MY LISTINGS - IMPORTANT: This must be BEFORE the /{listing_id} route ============
 @router.get("/my-listings")
 async def get_my_listings(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    include_drafts: bool = Query(True, description="Include draft listings")  # FIXED: Default is now True
+    include_drafts: bool = Query(True, description="Include draft listings")
 ):
     try:
-        print(f"Fetching listings for user: {current_user.email}")
-        print(f"Include drafts: {include_drafts}")
+        print(f"✅ Fetching listings for user: {current_user.email}, include_drafts: {include_drafts}")
         
         query = db.query(Listing).filter(Listing.user_id == current_user.id)
         
-        # Only filter out drafts if include_drafts is False
         if not include_drafts:
-            query = query.filter(Listing.is_draft == False, Listing.status == "active")
+            query = query.filter(and_(Listing.is_draft == False, Listing.status == "active"))
         
-        listings = query.order_by(Listing.created_at.desc()).all()
+        listings = query.order_by(desc(Listing.created_at)).all()
         
-        print(f"Found {len(listings)} listings")
+        print(f"✅ Found {len(listings)} listings")
         
         result = []
         for l in listings:
@@ -224,7 +223,7 @@ async def get_my_listings(
         return result
         
     except Exception as e:
-        print(f"Error fetching listings: {e}")
+        print(f"❌ Error fetching listings: {e}")
         return []
 
 # ============ GET SINGLE LISTING ============
@@ -268,7 +267,9 @@ async def get_listing(
             "phone_number": listing.phone_number,
             "email": listing.email,
             "status": listing.status,
-            "is_draft": listing.is_draft
+            "is_draft": listing.is_draft,
+            "views_count": listing.views_count,
+            "created_at": listing.created_at.isoformat() if listing.created_at else None
         }
         
     except HTTPException:
